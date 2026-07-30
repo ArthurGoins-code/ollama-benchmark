@@ -64,6 +64,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import platform
 import re
 import shutil
 import statistics
@@ -280,6 +282,107 @@ class PowerMonitor:
 
 def nvidia_smi_available() -> bool:
     return shutil.which("nvidia-smi") is not None
+
+
+# ======================================================================
+# System information (CPU / RAM / GPU / OS / Ollama version)
+# ======================================================================
+
+def get_cpu_info() -> Dict[str, Any]:
+    info: Dict[str, Any] = {
+        "model": None,
+        "architecture": platform.machine(),
+        "logical_cores": os.cpu_count(),
+    }
+    model_name = None
+    if platform.system() == "Linux":
+        try:
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if line.lower().startswith("model name"):
+                        model_name = line.split(":", 1)[1].strip()
+                        break
+        except OSError:
+            pass
+    elif platform.system() == "Darwin":
+        try:
+            out = subprocess.run(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                capture_output=True, text=True, timeout=5,
+            )
+            model_name = out.stdout.strip() or None
+        except Exception:
+            pass
+    info["model"] = model_name or platform.processor() or "unknown"
+    return info
+
+
+def get_memory_info() -> Dict[str, Any]:
+    info: Dict[str, Any] = {"total_gb": None}
+    system = platform.system()
+    if system == "Linux":
+        try:
+            meminfo = {}
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    key, _, value = line.partition(":")
+                    meminfo[key.strip()] = value.strip()
+            total_kb = meminfo.get("MemTotal", "").split()[0]
+            info["total_gb"] = round(int(total_kb) / (1024 ** 2), 2)
+        except Exception:
+            pass
+    elif system == "Darwin":
+        try:
+            out = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=5)
+            info["total_gb"] = round(int(out.stdout.strip()) / (1024 ** 3), 2)
+        except Exception:
+            pass
+    return info
+
+
+def get_gpu_info() -> List[Dict[str, Any]]:
+    gpus: List[Dict[str, Any]] = []
+    if not nvidia_smi_available():
+        return gpus
+    try:
+        cmd = ["nvidia-smi",
+               "--query-gpu=index,name,memory.total,driver_version,compute_cap",
+               "--format=csv,noheader"]
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=True)
+        for line in out.stdout.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 5:
+                gpus.append({
+                    "index": parts[0],
+                    "name": parts[1],
+                    "memory_total": parts[2],
+                    "driver_version": parts[3],
+                    "compute_capability": parts[4],
+                })
+    except Exception:
+        pass
+    return gpus
+
+
+def get_ollama_version() -> Optional[str]:
+    try:
+        out = subprocess.run(["ollama", "--version"], capture_output=True, text=True, timeout=10)
+        text = (out.stdout or out.stderr).strip()
+        return text or None
+    except Exception:
+        return None
+
+
+def get_system_info() -> Dict[str, Any]:
+    """Collects CPU, RAM, GPU, OS, Python and Ollama version info for the report."""
+    return {
+        "os": platform.platform(),
+        "python_version": platform.python_version(),
+        "cpu": get_cpu_info(),
+        "memory": get_memory_info(),
+        "gpus": get_gpu_info(),
+        "ollama_version": get_ollama_version(),
+    }
 
 
 def list_installed_models() -> List[str]:
@@ -723,18 +826,24 @@ def compute_composite_scores(aggregates: Dict[str, Dict[str, Any]], weights: Dic
 # Reporting
 # ======================================================================
 
-def print_leaderboard(composite: Dict[str, Dict[str, Any]], weights: Dict[str, float]) -> None:
+def build_leaderboard(composite: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Returns the composite results ranked best-to-worst, with an explicit rank field."""
     ranked = sorted(composite.items(), key=lambda kv: kv[1]["composite_score"], reverse=True)
+    return [{"rank": i, "model": model, **a} for i, (model, a) in enumerate(ranked, start=1)]
+
+
+def print_leaderboard(composite: Dict[str, Dict[str, Any]], weights: Dict[str, float]) -> None:
+    leaderboard = build_leaderboard(composite)
 
     headers = ["Rank", "Model", "Composite", "Correctness", "Tool-Use", "Success%",
                "Tok/s", "Avg W", "Tok/J"]
     rows = []
-    for i, (model, a) in enumerate(ranked, start=1):
+    for entry in leaderboard:
         rows.append([
-            str(i), model, f"{a['composite_score']:.1f}", f"{a['avg_correctness']:.1f}",
-            f"{a['avg_tool_use']:.1f}", f"{a['success_rate']:.0f}",
-            f"{a['avg_eval_rate_tps']:.1f}", f"{a['avg_power_w']:.1f}",
-            f"{a['avg_tokens_per_joule']:.3f}",
+            str(entry["rank"]), entry["model"], f"{entry['composite_score']:.1f}",
+            f"{entry['avg_correctness']:.1f}", f"{entry['avg_tool_use']:.1f}",
+            f"{entry['success_rate']:.0f}", f"{entry['avg_eval_rate_tps']:.1f}",
+            f"{entry['avg_power_w']:.1f}", f"{entry['avg_tokens_per_joule']:.3f}",
         ])
 
     widths = [max(len(headers[c]), max((len(r[c]) for r in rows), default=0)) for c in range(len(headers))]
@@ -754,9 +863,9 @@ def print_leaderboard(composite: Dict[str, Dict[str, Any]], weights: Dict[str, f
         print(fmt_row(row))
     print("=" * 100)
 
-    if ranked:
-        top_model, top_a = ranked[0]
-        print(f"\nRecommended model: {top_model}")
+    if leaderboard:
+        top_a = leaderboard[0]
+        print(f"\nRecommended model: {top_a['model']}")
         print(f"  - Composite score: {top_a['composite_score']:.1f}/100")
         print(f"  - Code correctness: {top_a['avg_correctness']:.1f}/100 "
               f"(success rate {top_a['success_rate']:.0f}%)")
@@ -768,30 +877,25 @@ def print_leaderboard(composite: Dict[str, Dict[str, Any]], weights: Dict[str, f
     print()
 
 
-def save_reports(all_results: List[RunResult], composite: Dict[str, Dict[str, Any]], output_dir: Path) -> tuple:
+def save_reports(all_results: List[RunResult], composite: Dict[str, Dict[str, Any]], output_dir: Path,
+                  weights: Optional[Dict[str, float]] = None,
+                  system_info: Optional[Dict[str, Any]] = None) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    leaderboard = build_leaderboard(composite)
 
     json_path = output_dir / f"benchmark_{timestamp}.json"
     json_path.write_text(json.dumps({
         "generated_at": datetime.now().isoformat(),
+        "system_info": system_info or {},
+        "weights": weights or {},
         "runs": [asdict(r) for r in all_results],
         "aggregates": composite,
+        "leaderboard": leaderboard,
     }, indent=2))
 
-    csv_path = output_dir / f"benchmark_{timestamp}_summary.csv"
-    with csv_path.open("w", newline="") as f:
-        import csv
-        writer = csv.writer(f)
-        writer.writerow(["model", "composite_score", "avg_correctness", "avg_tool_use",
-                          "success_rate_pct", "avg_eval_rate_tps", "avg_power_w",
-                          "avg_tokens_per_joule", "runs"])
-        for model, a in sorted(composite.items(), key=lambda kv: kv[1]["composite_score"], reverse=True):
-            writer.writerow([model, a["composite_score"], a["avg_correctness"], a["avg_tool_use"],
-                              a["success_rate"], a["avg_eval_rate_tps"], a["avg_power_w"],
-                              a["avg_tokens_per_joule"], a["runs"]])
-
-    return json_path, csv_path
+    return json_path
 
 
 # ======================================================================
@@ -815,7 +919,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=int, default=300,
                     help="Per-run timeout in seconds (default: 300).")
     p.add_argument("--output-dir", type=str, default="benchmark_results",
-                    help="Directory to write JSON/CSV reports to.")
+                    help="Directory to write JSON reports to.")
     p.add_argument("--power", dest="power", action="store_true", default=True,
                     help="Monitor GPU power via nvidia-smi (default: enabled).")
     p.add_argument("--no-power", dest="power", action="store_false",
@@ -892,6 +996,17 @@ def main() -> int:
     print(f"Tasks:  {', '.join(t.id for t in tasks)}")
     print(f"Iterations per task: {args.iterations} | Power monitoring: {power_enabled}\n")
 
+    system_info = get_system_info()
+    cpu = system_info["cpu"]
+    mem = system_info["memory"]
+    gpu_names = ", ".join(g["name"] for g in system_info["gpus"]) or "none detected"
+    print("System info:")
+    print(f"  OS:      {system_info['os']}")
+    print(f"  CPU:     {cpu['model']} ({cpu['logical_cores']} logical cores, {cpu['architecture']})")
+    print(f"  RAM:     {mem['total_gb']} GB" if mem.get("total_gb") else "  RAM:     unknown")
+    print(f"  GPU(s):  {gpu_names}")
+    print(f"  Ollama:  {system_info['ollama_version'] or 'unknown'}\n")
+
     all_results: List[RunResult] = []
 
     for model in models:
@@ -928,9 +1043,9 @@ def main() -> int:
 
     print_leaderboard(composite, weights)
 
-    json_path, csv_path = save_reports(all_results, composite, Path(args.output_dir))
+    json_path = save_reports(all_results, composite, Path(args.output_dir),
+                              weights=weights, system_info=system_info)
     print(f"Full results:    {json_path}")
-    print(f"Summary CSV:     {csv_path}")
 
     return 0
 

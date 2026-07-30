@@ -30,7 +30,7 @@ For every `(model, task)` pair the script:
    tokens-per-joule as an efficiency metric.
 
 Finally, results are aggregated per model and combined into a **weighted
-composite score**, then printed as a leaderboard and saved to JSON/CSV.
+composite score**, then printed as a leaderboard and saved to JSON.
 
 ### Important limitation: tool-use scoring is a proxy
 
@@ -78,7 +78,7 @@ python3 ollama_coding_benchmark.py --models modelA modelB \
 | `--list-tasks` | — | Print the built-in tasks and exit. |
 | `--iterations N` | `1` | Number of times to repeat each task per model. |
 | `--timeout SECONDS` | `300` | Per-run timeout. |
-| `--output-dir DIR` | `benchmark_results` | Directory to write JSON/CSV reports to. |
+| `--output-dir DIR` | `benchmark_results` | Directory to write JSON reports to. |
 | `--power` / `--no-power` | `--power` enabled | Enable/disable GPU power monitoring via `nvidia-smi`. |
 | `--gpu-index INDEX` | `0` | GPU index passed to `nvidia-smi`, or `all` to sum across every GPU. |
 | `--power-interval SECONDS` | `0.5` | Seconds between power samples. |
@@ -102,12 +102,19 @@ python3 ollama_coding_benchmark.py --models modelA modelB \
 
 - **Console leaderboard** ranking each model by composite score, with
   correctness, tool-use score, success rate, tokens/sec, average power (W),
-  and tokens/joule.
-- **`benchmark_results/benchmark_<timestamp>.json`** — full raw results for
-  every run (stdout/stderr, parsed stats, power samples summary, eval
-  results) plus the per-model aggregates.
-- **`benchmark_results/benchmark_<timestamp>_summary.csv`** — a compact
-  per-model summary suitable for spreadsheets.
+  and tokens/joule. A brief system info summary (OS, CPU, RAM, GPU, Ollama
+  version) is also printed before the benchmark starts.
+- **`benchmark_results/benchmark_<timestamp>.json`** — the full report,
+  containing:
+  - `system_info` — OS, Python version, CPU model/cores/architecture, total
+    RAM, GPU name/VRAM/driver/compute-capability (via `nvidia-smi`), and
+    Ollama version.
+  - `weights` — the composite-score weights used for this run.
+  - `runs` — full raw results for every run (stdout/stderr, parsed stats,
+    power samples summary, eval results).
+  - `aggregates` — per-model aggregated metrics.
+  - `leaderboard` — the same ranked leaderboard shown on the console,
+    as a JSON array with an explicit `rank` field per model.
 
 ## Notes & tips
 
