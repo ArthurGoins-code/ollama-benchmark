@@ -230,6 +230,67 @@ def nvidia_smi_available() -> bool:
     return shutil.which("nvidia-smi") is not None
 
 
+def _parse_gpu_temps(output: str) -> Optional[float]:
+    """Return the hottest GPU temperature (°C) found in `nvidia-smi` output, or None."""
+    temps: List[float] = []
+    for tok in output.split():
+        try:
+            temps.append(float(tok))
+        except ValueError:
+            continue
+    return max(temps) if temps else None
+
+
+def current_gpu_temp() -> Optional[float]:
+    """Hottest GPU temperature right now (°C), or None if no GPU / nvidia-smi."""
+    if not nvidia_smi_available():
+        return None
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=temperature.gpu",
+             "--format=csv,noheader,nounits"],
+            text=True, timeout=5, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+    return _parse_gpu_temps(out)
+
+
+def wait_for_gpu_cool_down(
+    thermal_threshold: float,
+    thermal_cooldown: float,
+    poll_interval: float = 1.0,
+    max_wait: float = 600.0,
+    log=print,
+) -> bool:
+    """After a test, block until the GPU cools to (threshold - cooldown).
+
+    No-op when there is no GPU, when the cool-down is disabled
+    (``thermal_cooldown <= 0``), or the GPU is already cool enough. Returns True
+    if it cooled down (or there was nothing to wait for), False if it hit
+    ``max_wait`` and is still hot (the caller then proceeds anyway).
+    """
+    if thermal_cooldown <= 0:
+        return True
+    target = thermal_threshold - thermal_cooldown
+    temp = current_gpu_temp()
+    if temp is None or temp <= target:
+        return True
+    log(f"[cooldown] GPU {temp:.1f}C is above target {target:.1f}C - "
+        f"cooling down before the next test")
+    t0 = time.time()
+    while time.time() - t0 < max_wait:
+        time.sleep(poll_interval)
+        temp = current_gpu_temp()
+        if temp is None:
+            return True
+        if temp <= target:
+            log(f"[cooldown] GPU cooled to {temp:.1f}C - resuming next test")
+            return True
+    log(f"[cooldown] GPU still {temp:.1f}C after {max_wait:.0f}s - continuing anyway")
+    return False
+
+
 def detect_thermal_throttle(
     powers: Sequence[float],
     temps: Sequence[Optional[float]],
@@ -1706,6 +1767,7 @@ def run_benchmark(
     workers: int,
     output_dir: str,
     thermal_threshold: float = 80.0,
+    thermal_cooldown: float = 8.0,
     resume: bool = False,
     verbose: bool = False,
     quiet: bool = False,
@@ -1748,10 +1810,14 @@ def run_benchmark(
         f"{len(pending)} to run | backend={backend} | workers={workers}")
 
     def do_run(model: str, task: Task, it: int) -> Tuple[str, RunResult]:
-        return _work_key(model, task, it), run_ollama(
+        rr = run_ollama(
             model, task, client, backend, options, timeout, tool_mode,
             max_agent_turns, verbose, thermal_threshold,
         )
+        # Thermal cool-down gate: let this test finish, then cool the GPU below
+        # (threshold - cooldown) so the next test starts from a non-throttled state.
+        wait_for_gpu_cool_down(thermal_threshold, thermal_cooldown, log=log)
+        return _work_key(model, task, it), rr
 
     def record(k: str, rr: RunResult) -> None:
         with _results_lock:
@@ -2233,6 +2299,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--ref-tpj", type=float, default=None, help="Absolute ref for power (tok/joule).")
     p.add_argument("--thermal-threshold", type=float, default=80.0,
                    help="GPU temp (C) at/above which a power drop is treated as thermal throttling.")
+    p.add_argument("--thermal-cooldown", type=float, default=8.0,
+                   help="After a test, wait for the GPU to cool to (threshold - this) before "
+                        "the next test; 0 disables the wait. (default: 8.0)")
     # Output / robustness
     p.add_argument("--output-dir", default="outputs", help="Directory for reports + checkpoint.")
     p.add_argument("--resume", action="store_true", help="Resume from an existing checkpoint.")
@@ -2326,6 +2395,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "workers": args.workers, "max_agent_turns": args.max_agent_turns,
         "normalize": args.normalize, "ref_rate": args.ref_rate, "ref_tpj": args.ref_tpj,
         "thermal_threshold": args.thermal_threshold,
+        "thermal_cooldown": args.thermal_cooldown,
         "host": (client.host if client else None),
     }
 
@@ -2335,6 +2405,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_agent_turns=args.max_agent_turns, iterations=args.iterations,
         workers=args.workers, output_dir=args.output_dir, resume=args.resume,
         thermal_threshold=args.thermal_threshold,
+        thermal_cooldown=args.thermal_cooldown,
         verbose=args.verbose, quiet=args.quiet,
     )
 

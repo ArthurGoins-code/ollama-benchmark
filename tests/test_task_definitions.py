@@ -241,6 +241,35 @@ def test_discover_models() -> None:
     assert m._discover_models(_StubClient(), "api") == ["m1", "m2"]
 
 
+def test_gpu_cool_down() -> None:
+    def _silence(msg: str) -> None:
+        pass
+
+    # _parse_gpu_temps: hottest value wins; non-numeric tokens ignored.
+    assert m._parse_gpu_temps("45\n60\n") == 60.0
+    assert m._parse_gpu_temps("55") == 55.0
+    assert m._parse_gpu_temps("") is None
+    assert m._parse_gpu_temps("n/a\n") is None
+
+    # wait_for_gpu_cool_down: no-op when already cool, disabled, or no GPU.
+    orig = m.current_gpu_temp
+    try:
+        m.current_gpu_temp = lambda: 50.0
+        assert m.wait_for_gpu_cool_down(80.0, 8.0, log=_silence) is True
+        m.current_gpu_temp = lambda: 90.0
+        assert m.wait_for_gpu_cool_down(80.0, 0.0, log=_silence) is True
+        m.current_gpu_temp = lambda: None
+        assert m.wait_for_gpu_cool_down(80.0, 8.0, log=_silence) is True
+        # hot -> cools over a couple of fast polls -> True
+        seq = iter([90.0, 80.0, 70.0])
+        m.current_gpu_temp = lambda: next(seq)
+        assert m.wait_for_gpu_cool_down(
+            80.0, 8.0, poll_interval=0.01, max_wait=1.0, log=_silence
+        ) is True
+    finally:
+        m.current_gpu_temp = orig
+
+
 def main() -> int:
     suites = [
         ("python reference solutions", test_python_reference_solutions),
@@ -250,6 +279,7 @@ def main() -> int:
         ("wrong solutions rejected", test_wrong_solutions_are_rejected),
         ("thermal-throttle detection", test_thermal_throttle_detection),
         ("discover-models (all)", test_discover_models),
+        ("gpu cool-down gate", test_gpu_cool_down),
     ]
     failures = []
     for name, fn in suites:

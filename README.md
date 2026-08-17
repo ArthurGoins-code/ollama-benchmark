@@ -108,6 +108,7 @@ python3 ollama_coding_benchmark.py --compare outputs/run_a/report.json outputs/r
 | `--normalize {relative,absolute}` | `relative` | Speed/power normalization basis. |
 | `--ref-rate F` / `--ref-tpj F` | — | Absolute references for speed / power. |
 | `--thermal-threshold F` | `80.0` | °C at/above which a power drop counts as thermal throttling. |
+| `--thermal-cooldown F` | `8.0` | After a test, wait for the GPU to cool to (threshold − this) before the next test; `0` disables. |
 | `--output-dir DIR` | `outputs` | Directory for reports + checkpoint. |
 | `--resume` | off | Resume from an existing checkpoint. |
 | `--list-tasks` | off | Print the built-in task set and exit. |
@@ -190,6 +191,16 @@ Thermal status appears everywhere the power metric does:
 If your card throttles at a different point, pass `--thermal-threshold <°C>` —
 e.g. lower it (e.g. `--thermal-threshold 75`) if it throttles earlier, or raise it
 (e.g. `--thermal-threshold 88`) to reduce false positives.
+
+### Cool-down between tests
+
+When the GPU is still above the cool-down target after a test, the runner waits
+for it to drop to `thermal_threshold − thermal-cooldown` (default: 8 °C below the
+threshold) before starting the next test — so no test runs while the card is still
+throttling. Tune the margin with `--thermal-cooldown` (e.g. `--thermal-cooldown 10`
+for a bigger safety margin) or set it to `0` to disable the wait. This is most
+meaningful with `--workers 1` (sequential), which is also the setting that yields
+the cleanest per-test power/thermal numbers.
 
 ## Output
 
