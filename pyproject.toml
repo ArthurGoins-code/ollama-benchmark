@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ollama-coding-benchmark"
+version = "2.0.0"
+description = "Benchmark Ollama models on coding, agentic, speed and power dimensions."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Arthur Goins", email = "arthur.ajg.goins@gmail.com" }]
+keywords = ["ollama", "benchmark", "llm", "coding", "evaluation", "agents", "gpu"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["ruff>=0.4"]
+
+[project.scripts]
+ollama-benchmark = "ollama_coding_benchmark:main"
+
+[tool.setuptools]
+py-modules = ["ollama_coding_benchmark"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["F", "E", "W"]
+ignore = [
+    "E501",  # line length (long task-definition strings)
+    "E203",  # whitespace before ':'
+    "E741",  # ambiguous variable names
+    "E731",  # do not assign a lambda (used in test-case strings)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
