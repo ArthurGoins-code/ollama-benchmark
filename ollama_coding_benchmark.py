@@ -2200,8 +2200,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     # Targets
-    p.add_argument("--models", nargs="+", default=["llama3.1:8b"],
-                   help="Model name(s) to benchmark.")
+    p.add_argument("--models", "-m", nargs="+", default=["all"],
+                   help="Model name(s) to benchmark (space-separated); 'all' = every installed model.")
     p.add_argument("--task-categories", nargs="+", default=None,
                    help="Only run tasks in these categories (e.g. Python JavaScript Agentic).")
     p.add_argument("--difficulty", choices=["easy", "medium", "hard", "all"], default="all",
@@ -2250,6 +2250,28 @@ def _model_matches(wanted: str, available: str) -> bool:
     return wanted == base or available.startswith(wanted)
 
 
+def _parse_ollama_list(output: str) -> List[str]:
+    """Extract model names from ``ollama list`` output (skips the header row)."""
+    names: List[str] = []
+    for line in output.splitlines()[1:]:
+        parts = line.split()
+        if parts:
+            names.append(parts[0])
+    return names
+
+
+def _discover_models(client: Optional["OllamaClient"], backend: str) -> List[str]:
+    """Return installed Ollama model names (API ``/api/tags``, else ``ollama list``)."""
+    if client is not None:
+        return client.list_models()
+    try:
+        out = subprocess.check_output(["ollama", "list"], text=True, timeout=10,
+                                      stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return _parse_ollama_list(out)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     try:
@@ -2282,14 +2304,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"error: Ollama server not reachable at {client.host}\n"
                   "       (start it with `ollama serve`, or use --backend cli)", file=sys.stderr)
             return 3
-        available = client.list_models()
-        for name in args.models:
-            if available and not any(_model_matches(name, a) for a in available):
-                print(f"[warn] model '{name}' not found on server "
-                      f"(available: {', '.join(available) or 'none'})", file=sys.stderr)
+
+    if "all" in args.models:
+        models = _discover_models(client, args.backend)
+        if not models:
+            print("error: --models all: no installed models found "
+                  "(is Ollama running? try `ollama list`)", file=sys.stderr)
+            return 3
+    else:
+        models = list(args.models)
+        if args.backend == "api" and client is not None:
+            available = client.list_models()
+            for name in models:
+                if available and not any(_model_matches(name, a) for a in available):
+                    print(f"[warn] model '{name}' not found on server "
+                          f"(available: {', '.join(available) or 'none'})", file=sys.stderr)
 
     config: Dict[str, Any] = {
-        "models": list(args.models), "backend": args.backend, "tool_mode": args.tool_mode,
+        "models": models, "backend": args.backend, "tool_mode": args.tool_mode,
         "options": options, "timeout": args.timeout, "iterations": args.iterations,
         "workers": args.workers, "max_agent_turns": args.max_agent_turns,
         "normalize": args.normalize, "ref_rate": args.ref_rate, "ref_tpj": args.ref_tpj,
@@ -2298,7 +2330,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     }
 
     results = run_benchmark(
-        models=args.models, tasks=tasks, client=client, backend=args.backend,
+        models=models, tasks=tasks, client=client, backend=args.backend,
         options=options, timeout=args.timeout, tool_mode=args.tool_mode,
         max_agent_turns=args.max_agent_turns, iterations=args.iterations,
         workers=args.workers, output_dir=args.output_dir, resume=args.resume,

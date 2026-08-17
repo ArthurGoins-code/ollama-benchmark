@@ -89,7 +89,7 @@ python3 ollama_coding_benchmark.py --compare outputs/run_a/report.json outputs/r
 
 | Flag | Default | Description |
 |---|---|---|
-| `--models M [M ...]` | `llama3.1:8b` | Model name(s) to benchmark. |
+| `--models M [M ...]`, `-m` | `all` | Model name(s) to benchmark (space-separated); `all` = every installed model. |
 | `--task-categories C [C ...]` | all | Only these categories (e.g. `Python JavaScript Agentic`). |
 | `--difficulty {easy,medium,hard,all}` | `all` | Only tasks of this difficulty. |
 | `--language {python,javascript,bash,all}` | `all` | Only code tasks in this language. |

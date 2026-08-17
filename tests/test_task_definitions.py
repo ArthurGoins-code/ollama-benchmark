@@ -224,6 +224,23 @@ def test_thermal_throttle_detection() -> None:
     assert d([200.0, 100.0], [85.0, 85.0], threshold_c=83.0)["thermal_throttled"] is False
 
 
+def test_discover_models() -> None:
+    sample = (
+        "NAME           ID              SIZE      MODIFIED\n"
+        "llama3.1:8b    46e0c10c039e    4.9 GB    2 months ago\n"
+        "qwen3:4b       abc123def0      2.5 GB    1 month ago\n"
+    )
+    assert m._parse_ollama_list(sample) == ["llama3.1:8b", "qwen3:4b"]
+    assert m._parse_ollama_list("NAME  ID  SIZE\n") == []
+    assert m._parse_ollama_list("") == []
+
+    class _StubClient:
+        def list_models(self):
+            return ["m1", "m2"]
+
+    assert m._discover_models(_StubClient(), "api") == ["m1", "m2"]
+
+
 def main() -> int:
     suites = [
         ("python reference solutions", test_python_reference_solutions),
@@ -232,6 +249,7 @@ def main() -> int:
         ("tool reference plans", test_tool_reference_plans),
         ("wrong solutions rejected", test_wrong_solutions_are_rejected),
         ("thermal-throttle detection", test_thermal_throttle_detection),
+        ("discover-models (all)", test_discover_models),
     ]
     failures = []
     for name, fn in suites:
