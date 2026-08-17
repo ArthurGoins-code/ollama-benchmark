@@ -107,6 +107,7 @@ python3 ollama_coding_benchmark.py --compare outputs/run_a/report.json outputs/r
 | `--workers N` | `1` | Concurrent workers (1 = serial). |
 | `--normalize {relative,absolute}` | `relative` | Speed/power normalization basis. |
 | `--ref-rate F` / `--ref-tpj F` | — | Absolute references for speed / power. |
+| `--thermal-threshold F` | `80.0` | °C at/above which a power drop counts as thermal throttling. |
 | `--output-dir DIR` | `outputs` | Directory for reports + checkpoint. |
 | `--resume` | off | Resume from an existing checkpoint. |
 | `--list-tasks` | off | Print the built-in task set and exit. |
@@ -154,6 +155,8 @@ python3 ollama_coding_benchmark.py --compare outputs/run_a/report.json outputs/r
 - **Speed** — tokens/sec, normalized (`relative` to the batch max, or
   `absolute` against `--ref-rate`).
 - **Power** — tokens/joule, normalized against the batch max or `--ref-tpj`.
+- **Thermal throttling** — detected from the power/temperature trace and flagged per
+  run and per model, so you know when a speed/power number was being throttled.
 - **Composite** — a weighted sum of the four; the leaderboard rank is by
   composite score.
 
@@ -167,13 +170,35 @@ python3 ollama_coding_benchmark.py --compare outputs/run_a/report.json outputs/r
   sandbox (up to `--max-agent-turns`) and is scored on whether the final file
   state passes verification. This measures genuine agentic behavior.
 
+## Thermal throttling detection
+
+While sampling power, the tool also records GPU **temperature** and **SM clock**. If,
+under continued generation load, power draw falls materially below the run's peak while
+the card is at/above the thermal threshold (default **80 °C**, tune with
+`--thermal-threshold`), the run is flagged as **thermally throttled** — matching the
+"near-max watts dropping without the load decreasing" symptom. A brief cool-down dip at
+the end of generation is not flagged (by then the card is already below the threshold).
+
+Thermal status appears everywhere the power metric does:
+
+- per-run `power` object in `report.json` (`thermal_throttled`, `thermal_throttle_events`,
+  `thermal_power_drop_pct`, `gpu_temp_max_c`, and the driver's `throttle_reason_flags`),
+- `results.csv` columns `gpu_temp_max_c`, `thermal_throttled`, `thermal_throttle_events`,
+- the leaderboard (console + Markdown) `Max °C` and `Therm?` columns,
+- and a `[THROTTLED]` marker on the live progress line.
+
+If your card throttles at a different point, pass `--thermal-threshold <°C>` —
+e.g. lower it (e.g. `--thermal-threshold 75`) if it throttles earlier, or raise it
+(e.g. `--thermal-threshold 88`) to reduce false positives.
+
 ## Output
 
 Reports are written under `--output-dir` (default `outputs/`):
 
 - `report.json` — full report: `system_info`, config/weights, raw `runs`,
   per-model aggregates (`summary`), and the ranked leaderboard data.
-- `results.csv` — flat per-run rows for spreadsheet use.
+- `results.csv` — flat per-run rows for spreadsheet use (incl. `gpu_temp_max_c`,
+  `thermal_throttled`, `thermal_throttle_events`).
 - `report.md` — a human-readable Markdown report.
 - `benchmark.ckpt.json` — the checkpoint used by `--resume` (safe to delete).
 

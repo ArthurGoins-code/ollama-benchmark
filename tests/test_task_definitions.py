@@ -203,6 +203,27 @@ def test_wrong_solutions_are_rejected() -> None:
     assert not ev["success"], f"tool_send_email: expected a failing score, got {ev}"
 
 
+def test_thermal_throttle_detection() -> None:
+    d = m.detect_thermal_throttle
+    # Hot + sustained power drop under continued load => throttled.
+    powers = [200.0] * 20 + [120.0] * 20
+    temps_hot = [70.0] * 20 + [85.0] * 20
+    r = d(powers, temps_hot, threshold_c=83.0)
+    assert r["thermal_throttled"] is True, r
+    assert r["thermal_throttle_events"] >= 1, r
+    assert (r["thermal_power_drop_pct"] or 0.0) >= 30.0, r
+
+    # Same power drop but the card is COOL (end-of-gen idle dip) => not throttled.
+    temps_cool = [70.0] * 20 + [45.0] * 20
+    assert d(powers, temps_cool, threshold_c=83.0)["thermal_throttled"] is False
+
+    # Hot but power stays high (no drop) => not throttled.
+    assert d([200.0] * 40, [85.0] * 40, threshold_c=83.0)["thermal_throttled"] is False
+
+    # Below the sample floor => not throttled (not enough data).
+    assert d([200.0, 100.0], [85.0, 85.0], threshold_c=83.0)["thermal_throttled"] is False
+
+
 def main() -> int:
     suites = [
         ("python reference solutions", test_python_reference_solutions),
@@ -210,6 +231,7 @@ def main() -> int:
         ("bash reference solutions", test_bash_reference_solutions),
         ("tool reference plans", test_tool_reference_plans),
         ("wrong solutions rejected", test_wrong_solutions_are_rejected),
+        ("thermal-throttle detection", test_thermal_throttle_detection),
     ]
     failures = []
     for name, fn in suites:

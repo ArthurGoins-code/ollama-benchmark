@@ -230,33 +230,130 @@ def nvidia_smi_available() -> bool:
     return shutil.which("nvidia-smi") is not None
 
 
-class PowerMonitor:
-    """Continuously sample GPU power draw via `nvidia-smi` in a background thread."""
+def detect_thermal_throttle(
+    powers: Sequence[float],
+    temps: Sequence[Optional[float]],
+    threshold_c: float = 80.0,
+    drop_frac: float = 0.15,
+    min_window: int = 6,
+) -> Dict[str, Any]:
+    """Detect GPU thermal throttling from sampled power + temperature.
 
-    def __init__(self, interval: float = 0.05):
+    Signature we look for: power draw falls materially below the run's peak
+    (>= ``drop_frac`` of peak) while the GPU is still in the thermal throttle
+    zone (``temp >= threshold_c``) for a sustained window (``min_window``
+    consecutive samples). This matches the observed "watts drop from near-max
+    under continued load, around 80-85C" behavior. A brief end-of-generation
+    idle dip does not qualify: by then the card is cooling, so temperature is
+    back below the threshold and the low-power run is short.
+    """
+    out: Dict[str, Any] = {
+        "thermal_throttled": False,
+        "thermal_throttle_events": 0,
+        "thermal_threshold_c": threshold_c,
+        "thermal_power_drop_pct": None,
+    }
+    if not powers or len(powers) < min_window:
+        return out
+    peak = max(powers)
+    if peak <= 0:
+        return out
+    floor = peak * (1.0 - drop_frac)  # any sample <= this is a material drop
+    events = 0
+    max_drop_pct: Optional[float] = None
+    run_len = 0
+    for i, p in enumerate(powers):
+        t = temps[i] if i < len(temps) else None
+        if p <= floor:
+            drop_pct = (1.0 - p / peak) * 100.0
+            max_drop_pct = drop_pct if max_drop_pct is None else max(max_drop_pct, drop_pct)
+        if t is not None and t >= threshold_c and p <= floor:
+            run_len += 1
+            if run_len == min_window:
+                events += 1  # a sustained throttle window was just confirmed
+        else:
+            run_len = 0
+    out["thermal_throttled"] = events > 0
+    out["thermal_throttle_events"] = events
+    if max_drop_pct is not None:
+        out["thermal_power_drop_pct"] = round(max_drop_pct, 1)
+    return out
+
+
+class PowerMonitor:
+    """Continuously sample GPU power, temperature and clocks via ``nvidia-smi``.
+
+    A daemon thread polls at ``interval`` seconds and records per-sample power
+    (W), temperature (C) and SM clock (MHz). :meth:`stop` returns aggregate
+    stats plus a thermal-throttle verdict from :func:`detect_thermal_throttle`.
+    """
+
+    def __init__(self, interval: float = 0.05, thermal_threshold: float = 80.0):
         self.interval = interval
-        self.samples: List[float] = []
+        self.samples: List[float] = []           # power draw (W)
+        self.temps: List[Optional[float]] = []   # temperature (C)
+        self.clocks: List[Optional[float]] = []  # SM clock (MHz)
+        self.reason_flags: int = 0               # OR of clocks_event_reasons.active
+        self.thermal_threshold = thermal_threshold
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.enabled = nvidia_smi_available()
 
-    def _sample_gpu_power(self) -> Optional[float]:
+    def _sample_gpu(self) -> Tuple[Optional[float], Optional[float], Optional[float], int]:
+        """Return ``(power_w, temp_c, clock_mhz, reason_flags)`` for one tick.
+
+        Multi-GPU: power is summed, temperature is the max (hottest), clock is
+        the min (most throttled), and reason flags are OR-ed across GPUs.
+        """
         try:
             out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=power.draw", "--format=csv,noheader,nounits"],
+                ["nvidia-smi",
+                 "--query-gpu=power.draw,temperature.gpu,clocks.sm,clocks_event_reasons.active",
+                 "--format=csv,noheader,nounits"],
                 stderr=subprocess.DEVNULL, timeout=2,
             ).decode().strip()
-            # If multiple GPUs, sum their power draw.
-            total = sum(float(x) for x in out.splitlines() if x.strip())
-            return total
+            power = 0.0
+            temps: List[float] = []
+            clocks: List[float] = []
+            flags = 0
+            for line in out.splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if not parts or not parts[0]:
+                    continue
+                try:
+                    power += float(parts[0])
+                except ValueError:
+                    continue
+                if len(parts) >= 2 and parts[1]:
+                    try:
+                        temps.append(float(parts[1]))
+                    except ValueError:
+                        pass
+                if len(parts) >= 3 and parts[2]:
+                    try:
+                        clocks.append(float(parts[2]))
+                    except ValueError:
+                        pass
+                if len(parts) >= 4 and parts[3]:
+                    try:
+                        flags |= int(float(parts[3]))
+                    except ValueError:
+                        pass
+            temp = max(temps) if temps else None
+            clock = min(clocks) if clocks else None
+            return power, temp, clock, flags
         except Exception:
-            return None
+            return None, None, None, 0
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            val = self._sample_gpu_power()
-            if val is not None:
-                self.samples.append(val)
+            power, temp, clock, flags = self._sample_gpu()
+            if power is not None:
+                self.samples.append(power)
+                self.temps.append(temp)
+                self.clocks.append(clock)
+            if flags:
+                self.reason_flags |= flags
             time.sleep(self.interval)
 
     def start(self) -> None:
@@ -268,15 +365,28 @@ class PowerMonitor:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=2)
-        if self.samples:
-            avg = sum(self.samples) / len(self.samples)
+        if not self.samples:
             return {
-                "gpu_power_avg_w": round(avg, 2),
-                "gpu_power_min_w": round(min(self.samples), 2),
-                "gpu_power_max_w": round(max(self.samples), 2),
-                "samples": len(self.samples),
+                "available": False,
+                "thermal_throttled": False,
+                "thermal_threshold_c": self.thermal_threshold,
             }
-        return {"available": False}
+        temps = [t for t in self.temps if t is not None]
+        clocks = [c for c in self.clocks if c is not None]
+        result: Dict[str, Any] = {
+            "gpu_power_avg_w": round(sum(self.samples) / len(self.samples), 2),
+            "gpu_power_min_w": round(min(self.samples), 2),
+            "gpu_power_max_w": round(max(self.samples), 2),
+            "samples": len(self.samples),
+            "gpu_temp_max_c": round(max(temps), 1) if temps else None,
+            "gpu_temp_avg_c": round(sum(temps) / len(temps), 1) if temps else None,
+            "gpu_clock_max_mhz": round(max(clocks), 1) if clocks else None,
+            "gpu_clock_min_mhz": round(min(clocks), 1) if clocks else None,
+            "throttle_reason_flags": self.reason_flags,
+        }
+        result.update(detect_thermal_throttle(
+            self.samples, self.temps, threshold_c=self.thermal_threshold))
+        return result
 
 
 
@@ -1447,6 +1557,7 @@ def run_ollama(
     tool_mode: str,
     max_agent_turns: int,
     verbose: bool = False,
+    thermal_threshold: float = 80.0,
 ) -> RunResult:
     """Run one (model, task) pair. Never raises: failures become a failed RunResult."""
     res = RunResult(
@@ -1463,7 +1574,7 @@ def run_ollama(
     use_native = (task.eval_type == "tool" and tool_mode == "native"
                   and backend == "api" and client is not None)
 
-    monitor = PowerMonitor() if nvidia_smi_available() else None
+    monitor = PowerMonitor(thermal_threshold=thermal_threshold) if nvidia_smi_available() else None
     if monitor:
         monitor.start()
     generation_failed = False
@@ -1572,6 +1683,8 @@ def _progress(log, done: int, total: int, rr: RunResult, verbose: bool) -> None:
     status = "PASS" if rr.success else "FAIL"
     line = (f"  [{done:>3}/{total}] {rr.model:30} {rr.task_id:24} "
             f"{status:4} score={rr.score:5.1f} {rr.latency_ms:9.0f}ms")
+    if (rr.power or {}).get("thermal_throttled"):
+        line += "  [THROTTLED]"
     if verbose and rr.error:
         line += f"  | {rr.error[:90]}"
     log(line)
@@ -1592,6 +1705,7 @@ def run_benchmark(
     iterations: int,
     workers: int,
     output_dir: str,
+    thermal_threshold: float = 80.0,
     resume: bool = False,
     verbose: bool = False,
     quiet: bool = False,
@@ -1636,7 +1750,7 @@ def run_benchmark(
     def do_run(model: str, task: Task, it: int) -> Tuple[str, RunResult]:
         return _work_key(model, task, it), run_ollama(
             model, task, client, backend, options, timeout, tool_mode,
-            max_agent_turns, verbose,
+            max_agent_turns, verbose, thermal_threshold,
         )
 
     def record(k: str, rr: RunResult) -> None:
@@ -1769,6 +1883,9 @@ def summarize_models(
             if e and r.stats.eval_count > 0:
                 tpj.append(r.stats.eval_count / e)
         lat = [r.latency_ms for r in rs if r.latency_ms > 0]
+        temps = [(r.power or {}).get("gpu_temp_max_c") for r in rs]
+        temps = [t for t in temps if t is not None]
+        throttled_runs = sum(1 for r in rs if (r.power or {}).get("thermal_throttled"))
         raw[model] = {
             "runs": len(rs),
             "pass_rate": (sum(1 for r in rs if r.success) / len(rs)) * 100.0,
@@ -1778,6 +1895,9 @@ def summarize_models(
             "tpj": _mean(tpj),
             "lat_mean": _mean(lat),
             "lat_std": _std(lat),
+            "gpu_temp_max_c": max(temps) if temps else None,
+            "thermal_throttled": throttled_runs > 0,
+            "thermal_throttled_runs": throttled_runs,
             "scores": [r.score for r in rs],
         }
 
@@ -1813,6 +1933,9 @@ def summarize_models(
             "score_max": max(scores) if scores else None,
             "score_median": _round(statistics.median(scores)) if scores else None,
             "score_std": _round(_std(scores)),
+            "gpu_temp_max_c": _round(r["gpu_temp_max_c"], 1),
+            "thermal_throttled": r["thermal_throttled"],
+            "thermal_throttled_runs": r["thermal_throttled_runs"],
         })
     summary.sort(key=lambda s: (s["composite"] is None, -(s["composite"] or 0.0)))
     for rank, s in enumerate(summary, 1):
@@ -1853,7 +1976,8 @@ CSV_FIELDS = [
     "model", "task_id", "task_category", "eval_type", "language", "difficulty",
     "success", "score", "passed", "total", "backend", "latency_ms",
     "prompt_count", "eval_count", "prompt_eval_rate_tps", "eval_rate_tps",
-    "total_duration_s", "ttft_s", "gpu_power_avg_w", "timestamp", "error",
+    "total_duration_s", "ttft_s", "gpu_power_avg_w", "gpu_temp_max_c",
+    "thermal_throttled", "thermal_throttle_events", "timestamp", "error",
 ]
 
 
@@ -1864,7 +1988,9 @@ def _csv_row(rr: RunResult) -> List[Any]:
         rr.model, rr.task_id, rr.task_category, rr.eval_type, rr.language, rr.difficulty,
         int(bool(rr.success)), rr.score, rr.passed, rr.total, rr.backend, rr.latency_ms,
         st.prompt_count, st.eval_count, st.prompt_eval_rate_tps, st.eval_rate_tps,
-        st.total_duration_s, st.ttft_s, p.get("gpu_power_avg_w", ""), rr.timestamp, rr.error,
+        st.total_duration_s, st.ttft_s, p.get("gpu_power_avg_w", ""),
+        p.get("gpu_temp_max_c", ""), int(bool(p.get("thermal_throttled"))),
+        p.get("thermal_throttle_events", ""), rr.timestamp, rr.error,
     ]
 
 
@@ -1918,15 +2044,16 @@ def write_markdown(report: Dict[str, Any], path: str) -> None:
         "",
         "## Leaderboard",
         "",
-        "| # | Model | Composite | Correctness | Agentic | Speed (tok/s) | Power (tok/J) | Pass rate | Runs |",
-        "|--:|---|--:|--:|--:|--:|--:|--:|--:|",
+        "| # | Model | Composite | Correctness | Agentic | Speed (tok/s) | Power (tok/J) | Pass rate | Max °C | Therm? | Runs |",
+        "|--:|---|--:|--:|--:|--:|--:|--:|---:|---|--:|",
     ]
     for s in report.get("summary", []):
-        L.append("| {} | {} | {} | {} | {} | {} | {} | {}% | {} |".format(
+        L.append("| {} | {} | {} | {} | {} | {} | {} | {}% | {} | {} | {} |".format(
             s.get("rank"), _md_cell(s.get("model")), _fmt(s.get("composite")),
             _fmt(s.get("correctness")), _fmt(s.get("agentic")),
             _fmt(s.get("speed_tps")), _fmt(s.get("tpj")),
-            _fmt(s.get("pass_rate"), 1), s.get("runs")))
+            _fmt(s.get("pass_rate"), 1), _fmt(s.get("gpu_temp_max_c"), 1),
+            "YES" if s.get("thermal_throttled") else "-", s.get("runs")))
     L += [
         "",
         "## Per-task breakdown",
@@ -1968,21 +2095,23 @@ def print_leaderboard(summary: Sequence[Dict[str, Any]], title: str = "Leaderboa
         print("\n  (no results)")
         return
     print(f"\n  {title}")
-    print("  " + "-" * 80)
-    print("  {:>3}  {:<24} {:>7} {:>6} {:>5} {:>10} {:>8} {:>6} {:>5}".format(
-        "#", "Model", "Comp", "Corr", "Agen", "Speed t/s", "Power", "Pass%", "Runs"))
-    print("  " + "-" * 80)
+    print("  " + "-" * 96)
+    print("  {:>3}  {:<22} {:>7} {:>6} {:>5} {:>9} {:>8} {:>6} {:>5} {:>5} {:>6}".format(
+        "#", "Model", "Comp", "Corr", "Agen", "Speed", "Power", "Pass%", "MaxC", "Therm"))
+    print("  " + "-" * 96)
 
     def g(row: Dict[str, Any], k: str, nd: int = 1) -> str:
         v = row.get(k)
         return "-" if v is None else (f"{v:.{nd}f}" if isinstance(v, float) else str(v))
 
     for s in summary:
-        print("  {:>3}  {:<24} {:>7} {:>6} {:>5} {:>10} {:>8} {:>6} {:>5}".format(
-            s.get("rank"), (s.get("model") or "")[:24],
+        print("  {:>3}  {:<22} {:>7} {:>6} {:>5} {:>9} {:>8} {:>6} {:>5} {:>5} {:>6}".format(
+            s.get("rank"), (s.get("model") or "")[:22],
             g(s, "composite"), g(s, "correctness"), g(s, "agentic"),
-            g(s, "speed_tps", 2), g(s, "tpj", 3), g(s, "pass_rate", 1), s.get("runs")))
-    print("  " + "-" * 80)
+            g(s, "speed_tps", 2), g(s, "tpj", 3), g(s, "pass_rate", 1),
+            g(s, "gpu_temp_max_c", 1),
+            "YES" if s.get("thermal_throttled") else "-"))
+    print("  " + "-" * 96)
 
 
 def _load_report(path: str) -> Dict[str, Any]:
@@ -2102,6 +2231,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="Speed/power normalization: relative to batch max or absolute reference.")
     p.add_argument("--ref-rate", type=float, default=None, help="Absolute ref for speed (tok/s).")
     p.add_argument("--ref-tpj", type=float, default=None, help="Absolute ref for power (tok/joule).")
+    p.add_argument("--thermal-threshold", type=float, default=80.0,
+                   help="GPU temp (C) at/above which a power drop is treated as thermal throttling.")
     # Output / robustness
     p.add_argument("--output-dir", default="outputs", help="Directory for reports + checkpoint.")
     p.add_argument("--resume", action="store_true", help="Resume from an existing checkpoint.")
@@ -2162,6 +2293,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "options": options, "timeout": args.timeout, "iterations": args.iterations,
         "workers": args.workers, "max_agent_turns": args.max_agent_turns,
         "normalize": args.normalize, "ref_rate": args.ref_rate, "ref_tpj": args.ref_tpj,
+        "thermal_threshold": args.thermal_threshold,
         "host": (client.host if client else None),
     }
 
@@ -2170,6 +2302,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         options=options, timeout=args.timeout, tool_mode=args.tool_mode,
         max_agent_turns=args.max_agent_turns, iterations=args.iterations,
         workers=args.workers, output_dir=args.output_dir, resume=args.resume,
+        thermal_threshold=args.thermal_threshold,
         verbose=args.verbose, quiet=args.quiet,
     )
 
