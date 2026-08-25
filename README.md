@@ -89,7 +89,7 @@ python3 ollama_coding_benchmark.py --compare outputs/run_a/report.json outputs/r
 
 | Flag | Default | Description |
 |---|---|---|
-| `--models M [M ...]`, `-m` | `all` | Model name(s) to benchmark (space-separated); `all` = every installed model. |
+| `--models M [M ...]`, `-m` | (interactive) | Model name(s) to benchmark (space-separated); `all` = every installed model. If omitted, installed models are shown as a numbered list and you select which to run by entering comma-separated numbers (e.g. `1,3`). Non-interactive runs fall back to all installed models. |
 | `--task-categories C [C ...]` | all | Only these categories (e.g. `Python JavaScript Agentic`). |
 | `--difficulty {easy,medium,hard,all}` | `all` | Only tasks of this difficulty. |
 | `--language {python,javascript,bash,all}` | `all` | Only code tasks in this language. |

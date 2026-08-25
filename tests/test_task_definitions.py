@@ -15,6 +15,7 @@ Or via pytest::
 """
 from __future__ import annotations
 
+import builtins
 import json
 import os
 import shutil
@@ -241,6 +242,38 @@ def test_discover_models() -> None:
     assert m._discover_models(_StubClient(), "api") == ["m1", "m2"]
 
 
+def test_prompt_for_models() -> None:
+    installed = ["llama3.1:8b", "qwen3:4b", "mistral:7b"]
+
+    def run(stdin_values):
+        """Feed ``stdin_values`` (in order) to input(); raise EOFError when exhausted."""
+        it = iter(stdin_values)
+
+        def fake_input(prompt=""):
+            try:
+                return next(it)
+            except StopIteration:
+                raise EOFError
+
+        orig = builtins.input
+        builtins.input = fake_input
+        try:
+            return m._prompt_for_models(installed)
+        finally:
+            builtins.input = orig
+
+    # Single selection.
+    assert run(["1\n"]) == ["llama3.1:8b"]
+    # Comma-separated, multi selection.
+    assert run(["2,3\n"]) == ["qwen3:4b", "mistral:7b"]
+    # Whitespace-tolerant and de-duplicated (order preserved).
+    assert run(["3 , 1, 3\n"]) == ["mistral:7b", "llama3.1:8b"]
+    # Invalid entries re-prompt until a valid one is given.
+    assert run(["9\n", "ab\n", "2\n"]) == ["qwen3:4b"]
+    # Non-interactive (EOF) falls back to every installed model.
+    assert run([]) == installed
+
+
 def test_gpu_cool_down() -> None:
     def _silence(msg: str) -> None:
         pass
@@ -279,6 +312,7 @@ def main() -> int:
         ("wrong solutions rejected", test_wrong_solutions_are_rejected),
         ("thermal-throttle detection", test_thermal_throttle_detection),
         ("discover-models (all)", test_discover_models),
+        ("interactive model picker", test_prompt_for_models),
         ("gpu cool-down gate", test_gpu_cool_down),
     ]
     failures = []

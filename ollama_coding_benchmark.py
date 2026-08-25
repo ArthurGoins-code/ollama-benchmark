@@ -2163,7 +2163,7 @@ def print_leaderboard(summary: Sequence[Dict[str, Any]], title: str = "Leaderboa
     print(f"\n  {title}")
     print("  " + "-" * 96)
     print("  {:>3}  {:<22} {:>7} {:>6} {:>5} {:>9} {:>8} {:>6} {:>5} {:>5} {:>6}".format(
-        "#", "Model", "Comp", "Corr", "Agen", "Speed", "Power", "Pass%", "MaxC", "Therm"))
+        "#", "Model", "Comp", "Corr", "Agen", "Speed", "Power", "Pass%", "MaxC", "Therm", "Runs"))
     print("  " + "-" * 96)
 
     def g(row: Dict[str, Any], k: str, nd: int = 1) -> str:
@@ -2176,7 +2176,7 @@ def print_leaderboard(summary: Sequence[Dict[str, Any]], title: str = "Leaderboa
             g(s, "composite"), g(s, "correctness"), g(s, "agentic"),
             g(s, "speed_tps", 2), g(s, "tpj", 3), g(s, "pass_rate", 1),
             g(s, "gpu_temp_max_c", 1),
-            "YES" if s.get("thermal_throttled") else "-"))
+            "YES" if s.get("thermal_throttled") else "-", s.get("runs")))
     print("  " + "-" * 96)
 
 
@@ -2266,8 +2266,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     # Targets
-    p.add_argument("--models", "-m", nargs="+", default=["all"],
-                   help="Model name(s) to benchmark (space-separated); 'all' = every installed model.")
+    p.add_argument("--models", "-m", nargs="+", default=None,
+                   help="Model name(s) to benchmark (space-separated); 'all' = every installed "
+                        "model. If omitted, installed models are listed and you pick by number.")
     p.add_argument("--task-categories", nargs="+", default=None,
                    help="Only run tasks in these categories (e.g. Python JavaScript Agentic).")
     p.add_argument("--difficulty", choices=["easy", "medium", "hard", "all"], default="all",
@@ -2341,6 +2342,59 @@ def _discover_models(client: Optional["OllamaClient"], backend: str) -> List[str
     return _parse_ollama_list(out)
 
 
+def _prompt_for_models(installed: List[str]) -> List[str]:
+    """Show installed models as a numbered list and let the user pick by number.
+
+    Prints a numbered list of ``installed`` models and reads a comma-separated
+    list of numbers (e.g. ``1,3``) from the user, returning the corresponding
+    model names. Invalid selections re-prompt. When stdin is not interactive
+    (e.g. running under CI, a script, or a closed pipe) or no valid selection
+    can be read, every installed model is selected so the default stays safe
+    for non-interactive use.
+    """
+    print("\nInstalled Ollama models:")
+    for idx, name in enumerate(installed, start=1):
+        print(f"  {idx:>3}  {name}")
+    prompt = (f"\nSelect model(s) to benchmark "
+              f"(comma-separated, e.g. 1,3) [1-{len(installed)}]: ")
+
+    def _read() -> Optional[str]:
+        try:
+            return input(prompt).strip()
+        except EOFError:
+            return None
+
+    while True:
+        raw = _read()
+        if raw is None:
+            print(f"[note] no interactive input available; benchmarking all "
+                  f"{len(installed)} installed model(s)", file=sys.stderr)
+            return list(installed)
+
+        choices: List[int] = []
+        ok = True
+        for token in raw.replace(";", ",").split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if not token.isdigit() or not (1 <= int(token) <= len(installed)):
+                ok = False
+                break
+            choices.append(int(token))
+
+        if not ok or not choices:
+            print(f"[error] enter number(s) from 1-{len(installed)} "
+                  f"separated by commas (e.g. 1,3)", file=sys.stderr)
+            continue
+
+        # De-duplicate while preserving the order the user typed them.
+        seen: List[int] = []
+        for n in choices:
+            if n not in seen:
+                seen.append(n)
+        return [installed[n - 1] for n in seen]
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     try:
@@ -2374,7 +2428,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   "       (start it with `ollama serve`, or use --backend cli)", file=sys.stderr)
             return 3
 
-    if "all" in args.models:
+    if args.models is None:
+        # No --models given: show installed models and let the user pick.
+        installed = _discover_models(client, args.backend)
+        if not installed:
+            print("error: no installed models found "
+                  "(is Ollama running? try `ollama list`, or pass --models NAME)",
+                  file=sys.stderr)
+            return 3
+        models = _prompt_for_models(installed)
+    elif "all" in args.models:
         models = _discover_models(client, args.backend)
         if not models:
             print("error: --models all: no installed models found "
